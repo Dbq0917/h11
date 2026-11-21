@@ -16,6 +16,7 @@ from .._state import (
     CLOSED,
     DONE,
     ERROR,
+    IDLE,
     MIGHT_SWITCH_PROTOCOL,
     MUST_CLOSE,
     SEND_BODY,
@@ -164,8 +165,10 @@ def test_Connection_basics_and_content_length() -> None:
     data = p.send(SERVER, EndOfMessage(), expect=[])
     assert data == b""
 
+    # With nothing left in the receive buffer, a finished keep-alive cycle
+    # auto-advances straight back to IDLE so the connection can be reused.
     for conn in p.conns:
-        assert conn.states == {CLIENT: DONE, SERVER: DONE}
+        assert conn.states == {CLIENT: IDLE, SERVER: IDLE}
 
 
 def test_chunked() -> None:
@@ -195,8 +198,9 @@ def test_chunked() -> None:
     p.send(SERVER, Data(data=b"12345", chunk_start=True, chunk_end=True))
     p.send(SERVER, EndOfMessage())
 
+    # Empty buffer at end of cycle -> auto-reset for the next cycle.
     for conn in p.conns:
-        assert conn.states == {CLIENT: DONE, SERVER: DONE}
+        assert conn.states == {CLIENT: IDLE, SERVER: IDLE}
 
 
 def test_chunk_boundaries() -> None:
@@ -499,9 +503,10 @@ def test_reuse_simple() -> None:
             EndOfMessage(),
         ],
     )
+    # Both sides finished with an empty buffer, so each connection has already
+    # advanced itself back to IDLE and is ready for another request.
     for conn in p.conns:
-        assert conn.states == {CLIENT: DONE, SERVER: DONE}
-        conn.start_next_cycle()
+        assert conn.states == {CLIENT: IDLE, SERVER: IDLE}
 
     p.send(
         CLIENT,
@@ -517,6 +522,77 @@ def test_reuse_simple() -> None:
             EndOfMessage(),
         ],
     )
+    for conn in p.conns:
+        assert conn.states == {CLIENT: IDLE, SERVER: IDLE}
+
+
+def test_keepalive_auto_advances_to_next_cycle() -> None:
+    # Regression test: after a full request/response cycle on a keep-alive
+    # connection with no bytes left over, the state machine must advance back
+    # to IDLE on its own. Otherwise a connection pool reusing this connection
+    # can't send the second request (the send raises and the read side spins
+    # on NEED_DATA/PAUSED until its timeout).
+    p = ConnectionPair()
+
+    p.send(
+        CLIENT,
+        [Request(method="GET", target="/one", headers=[("Host", "a")]), EndOfMessage()],
+    )
+    p.send(
+        SERVER,
+        [
+            Response(status_code=200, headers=[(b"transfer-encoding", b"chunked")]),
+            EndOfMessage(),
+        ],
+    )
+
+    # Reusing the same Connection objects for a second request works without
+    # an explicit start_next_cycle() call, and the second request actually
+    # gets a response.
+    p.send(
+        CLIENT,
+        [
+            Request(method="DELETE", target="/two", headers=[("Host", "a")]),
+            EndOfMessage(),
+        ],
+    )
+    p.send(
+        SERVER,
+        [
+            Response(status_code=404, headers=[(b"transfer-encoding", b"chunked")]),
+            EndOfMessage(),
+        ],
+    )
+    for conn in p.conns:
+        assert conn.states == {CLIENT: IDLE, SERVER: IDLE}
+
+
+def test_keepalive_residual_bytes_are_not_a_new_request() -> None:
+    # Auto-advancing must not make buffered, not-yet-processed bytes look like
+    # the start of a brand new request. With residual bytes in the buffer we
+    # stay DONE and keep returning PAUSED until start_next_cycle() is called.
+    c = Connection(SERVER)
+    c.receive_data(
+        b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\n" b"GET /2 HTTP/1.1\r\nHost: a\r\n\r\n"
+    )
+    assert get_all_events(c) == [
+        Request(method="GET", target="/1", headers=[("host", "a")]),
+        EndOfMessage(),
+    ]
+    assert c.their_state is DONE
+    assert c.next_event() is PAUSED
+
+    c.send(Response(status_code=200, headers=[]))
+    c.send(EndOfMessage())
+    # Residual bytes present -> no auto-reset, still paused on DONE.
+    assert c.states == {CLIENT: DONE, SERVER: DONE}
+    assert c.next_event() is PAUSED
+
+    c.start_next_cycle()
+    assert get_all_events(c) == [
+        Request(method="GET", target="/2", headers=[("host", "a")]),
+        EndOfMessage(),
+    ]
 
 
 def test_pipelining() -> None:
@@ -575,17 +651,22 @@ def test_pipelining() -> None:
     c.send(Response(status_code=200, headers=[]))
     c.send(EndOfMessage())
 
-    # Arrival of more data triggers pause
+    # The empty-buffer cycle auto-reset to IDLE, so freshly arrived bytes are
+    # treated as the start of the next request. Incomplete data just means we
+    # need more, rather than a pause.
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
     assert c.next_event() is NEED_DATA
     c.receive_data(b"SADF")
-    assert c.next_event() is PAUSED
+    assert c.next_event() is NEED_DATA
     assert c.trailing_data == (b"SADF", False)
-    # If EOF arrives while paused, we don't see that either:
+    # EOF before the partial request completes is an unexpected close:
     c.receive_data(b"")
+    with pytest.raises(RemoteProtocolError):
+        c.next_event()
     assert c.trailing_data == (b"SADF", True)
-    assert c.next_event() is PAUSED
     c.receive_data(b"")
-    assert c.next_event() is PAUSED
+    with pytest.raises(RemoteProtocolError):
+        c.next_event()
     # Can't call receive_data with non-empty buf after closing it
     with pytest.raises(RuntimeError):
         c.receive_data(b"FDSA")
@@ -654,7 +735,8 @@ def test_protocol_switch() -> None:
         p.send(SERVER, EndOfMessage())
         # Check that re-use is still allowed after a denial
         for conn in p.conns:
-            conn.start_next_cycle()
+            # The empty-buffer cycle auto-reset, leaving us back in IDLE.
+            assert conn.states == {CLIENT: IDLE, SERVER: IDLE}
 
         # Test accept case
         p = setup()

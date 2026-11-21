@@ -305,9 +305,13 @@ request/response cycle has totally finished, but the connection itself
 is still viable, and we can start over and send a new request on this
 same connection.
 
-To do this, we tell h11 to get ready (this is needed as a safety
-measure to make sure different requests/responses on the same
-connection don't get accidentally mixed up):
+To do this, we tell h11 to get ready. When the receive buffer is empty
+this actually happens automatically as soon as the cycle finishes, but
+calling it explicitly is always valid and makes the transition clear
+(it is also required when there are buffered bytes, e.g. from a
+pipelined client -- this is the safety measure that makes sure
+different requests/responses on the same connection don't get
+accidentally mixed up):
 
 .. ipython:: python
 

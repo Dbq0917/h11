@@ -246,11 +246,35 @@ class Connection:
         """
         old_states = dict(self._cstate.states)
         self._cstate.start_next_cycle()
+        self._after_cycle_reset(old_states)
+
+    def _after_cycle_reset(
+        self, old_states: Dict[Type[Sentinel], Type[Sentinel]]
+    ) -> None:
         self._request_method = None
         # self.their_http_version gets left alone, since it presumably lasts
         # beyond a single request/response cycle
         assert not self.client_is_waiting_for_100_continue
         self._respond_to_state_changes(old_states)
+
+    def _maybe_auto_advance_cycle(self) -> None:
+        # Once a full request/response cycle has finished (both roles in
+        # DONE) on a keep-alive connection, we're ready for the next cycle.
+        # But we only do this automatically when the receive buffer is empty.
+        # If any bytes remain (e.g. a pipelined request, or just the first
+        # bytes of the next message), we stay in DONE and next_event() keeps
+        # returning PAUSED: those bytes belong to the next cycle and must not
+        # be mistaken for the start of a brand new request, so the user drives
+        # the transition explicitly via start_next_cycle(). With an empty
+        # buffer there is nothing left over, so we reset to IDLE/IDLE ourselves
+        # and the connection becomes immediately reusable.
+        if self._cstate.states != {CLIENT: DONE, SERVER: DONE}:
+            return
+        if self._receive_buffer:
+            return
+        old_states = dict(self._cstate.states)
+        self._cstate.start_next_cycle()
+        self._after_cycle_reset(old_states)
 
     def _process_error(self, role: Type[Sentinel]) -> None:
         old_states = dict(self._cstate.states)
@@ -316,6 +340,7 @@ class Connection:
             self.client_is_waiting_for_100_continue = False
 
         self._respond_to_state_changes(old_states, event)
+        self._maybe_auto_advance_cycle()
 
     def _get_io_object(
         self,

@@ -638,9 +638,26 @@ that you're actively choosing.
 If you want to re-use a connection, you have to wait until both the
 request and the response have been completed, bringing both the client
 and server to the :data:`DONE` state. Once this has happened, you can
-explicitly call :meth:`Connection.start_next_cycle` to reset both
-sides back to the :data:`IDLE` state. This makes sure that the client
-and server remain synched up.
+re-use it for another request/response cycle. When there are no
+unprocessed bytes left in the receive buffer, this happens
+automatically: as soon as both sides reach :data:`DONE`, the
+connection resets itself back to :data:`IDLE` and is immediately ready
+for the next cycle, so you don't have to do anything special before
+sending the next request.
+
+If there *are* unprocessed bytes in the receive buffer when
+:data:`DONE` is reached -- which mainly happens on a server handling a
+pipelining client -- then those bytes belong to the next cycle and the
+connection does not reset itself. Instead :meth:`~Connection.next_event`
+returns :data:`PAUSED` until you explicitly call
+:meth:`Connection.start_next_cycle`. This keeps the two
+request/response cycles from getting mixed up, and makes sure that the
+client and server remain synched up.
+
+You can still call :meth:`Connection.start_next_cycle` explicitly if
+you prefer; it performs the same reset and raises a
+:exc:`LocalProtocolError` if the connection is not currently in a
+reusable state.
 
 If keep-alive is disabled for whatever reason -- someone set
 ``Connection: close``, lack of protocol support, one of the sides just
@@ -659,19 +676,21 @@ because it makes things like error recovery very complicated.
 
 As a client, h11 does not support pipelining. This is enforced by the
 structure of the state machine: after sending one :class:`Request`,
-you can't send another until after calling
-:meth:`~Connection.start_next_cycle`, and you can't call
-:meth:`~Connection.start_next_cycle` until the server has entered the
-:data:`DONE` state, which requires reading the server's full
-response.
+you can't send another until the current cycle has completed -- which
+requires reading the server's full response, bringing both sides to
+:data:`DONE` (and then, with an empty buffer, automatically back to
+:data:`IDLE`). Calling :meth:`~Connection.start_next_cycle` explicitly
+has the same effect.
 
 As a server, h11 provides the minimal support for pipelining required
 to comply with the HTTP/1.1 standard: if the client sends multiple
 pipelined requests, then we handle the first request until we reach the
 :data:`DONE` state, and then :meth:`~Connection.next_event` will
-pause and refuse to parse any more events until the response is
-completed and :meth:`~Connection.start_next_cycle` is called. See the
-next section for more details.
+pause and refuse to parse any more events, because the extra requests
+are still sitting in the receive buffer. That pause only clears once
+the response is completed and :meth:`~Connection.start_next_cycle` is
+called, which then exposes the next buffered request. See the next
+section for more details.
 
 
 .. _flow-control:
@@ -738,8 +757,11 @@ state. There are three cases where this can happen:
 1) We received a full request/response from the remote peer, and then
    we received some more data after that. (The main situation where
    this might happen is a server responding to a pipelining client.)
-   The :data:`PAUSED` state will go away after you call
-   :meth:`~Connection.start_next_cycle`.
+   The leftover bytes belong to the next cycle, so the connection stays
+   in :data:`DONE` and the :data:`PAUSED` state only goes away after
+   you call :meth:`~Connection.start_next_cycle`. When there is no
+   leftover data, the connection instead resets itself to :data:`IDLE`
+   automatically and this pause never occurs.
 
 2) A successful ``CONNECT`` or ``Upgrade:`` request has caused the
    connection to switch to some other protocol (see
